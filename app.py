@@ -5,11 +5,17 @@ import sympy as sp
 from functools import wraps
 import random
 from sympy import Integer
+import base64
+import re
+from flask import jsonify
+import os, base64, re
+from flask import jsonify
 
 app = Flask(__name__)
 app.secret_key = "change-this-to-a-random-secret"  # needed for sessions
 
 DB_PATH = "mathsite.db"
+
 
 
 # -------------------------
@@ -34,6 +40,38 @@ def init_db():
 
 init_db()
 
+def is_equivalent_input(user_text: str, expected_value_str: str):
+    """
+    Accepts:
+      - "7/3"
+      - "(3/12)+8" (expression)
+      - "((3/12)+8) = 8.25" (equation)
+    Checks if input is mathematically equivalent to expected value.
+    """
+    t = (user_text or "").strip()
+    if not t:
+        return False
+
+    # allow unicode division/multiply
+    t = t.replace("×", "*").replace("÷", "/")
+
+    expected = sp.Rational(expected_value_str)
+
+    try:
+        if "=" in t:
+            lhs, rhs = t.split("=", 1)
+            lhs_expr = sp.simplify(sp.sympify(lhs))
+            rhs_expr = sp.simplify(sp.sympify(rhs))
+            # equation must be true, AND equal to expected
+            eq_ok = (sp.simplify(lhs_expr - rhs_expr) == 0)
+            val_ok = (sp.simplify(lhs_expr - expected) == 0)
+            return bool(eq_ok and val_ok)
+        else:
+            expr = sp.simplify(sp.sympify(t))
+            return bool(sp.simplify(expr - expected) == 0)
+    except:
+        return False
+
 
 # -------------------------
 # Auth helpers
@@ -50,7 +88,7 @@ def login_required(fn):
 # -------------------------
 # UI templates
 # -------------------------
-BASE_HTML = """
+BASE_HTML = r"""
 <!doctype html>
 <html>
 <head>
@@ -60,7 +98,7 @@ BASE_HTML = """
   <!-- MathJax for LaTeX rendering -->
   <script>
     window.MathJax = {
-      tex: { inlineMath: [['\\\\(', '\\\\)'], ['$', '$']] }
+      tex: { inlineMath: [['\\(', '\\)'], ['$', '$']] }
     };
   </script>
   <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
@@ -81,25 +119,28 @@ BASE_HTML = """
     .muted { color: #666; }
     .flash { background:#fff4cc; border:1px solid #ffe08a; padding:10px; border-radius:10px; margin: 12px 0; }
     .center { max-width: 520px; margin: 40px auto; }
-    .formgrid { display:grid; grid-template-columns: 220px 220px 1fr auto; gap:14px; align-items:end; }
-    .field label { display:block; font-weight:700; margin-bottom:6px; }
-    .field input, .field select { width:100%; padding:10px; border:1px solid #ddd; border-radius:10px; }
-    .checks { display:flex; gap:16px; flex-wrap:wrap; align-items:center; padding-top:26px; }
-    .checks label { display:flex; gap:8px; align-items:center; font-weight:600; }
-    .checks input { width:auto; margin:0; }
-    .actions { padding-top:26px; }
     /* ✅ Fix: don't apply the big input styling to checkboxes/radios */
-    input[type="checkbox"], input[type="radio"] {
-        width: auto !important;
-        margin: 0 !important;
-        padding: 0 !important;
+    input[type="checkbox"], input[type="radio"] { width:auto !important; margin:0 !important; padding:0 !important; }
+
+    /* Drawing UI */
+    .draw-wrap { border: 1px solid #e5e5e5; border-radius: 14px; padding: 12px; margin-top: 10px; }
+    .draw-canvas {
+      width: 100%;
+      height: 220px;
+      border: 1px solid #ddd;
+      border-radius: 14px;
+      background: #fff;
+      touch-action: none; /* IMPORTANT: allow drawing on mobile/trackpad */
+      display: block;
     }
+    .draw-actions { display:flex; gap:10px; flex-wrap:wrap; margin-top:10px; }
+    .btn-lite { background:#333; }
   </style>
 </head>
-<body>
 
+<body>
   <div class="topbar">
-    <div class="brand">Math Practice</div>
+    <div class="brand">UCZAcademy</div>
     <div class="auth">
       {% if session.get("user_id") %}
         <span class="muted">Hi, {{ session.get("username") }}</span>
@@ -135,6 +176,114 @@ BASE_HTML = """
     {{ content|safe }}
   </div>
 
+  <script>
+  // ---- Drawing helpers (supports multiple canvases) ----
+  function initOneCanvas(canvas) {
+    const ctx = canvas.getContext("2d");
+    ctx.lineCap = "round";
+    ctx.lineJoin = "round";
+    ctx.lineWidth = 4;
+
+    // Fix for retina / CSS sizing mismatch:
+    function resizeToCSS() {
+      const rect = canvas.getBoundingClientRect();
+      const dpr = window.devicePixelRatio || 1;
+      canvas.width = Math.max(1, Math.floor(rect.width * dpr));
+      canvas.height = Math.max(1, Math.floor(rect.height * dpr));
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0); // scale drawing coords to CSS pixels
+      ctx.clearRect(0, 0, rect.width, rect.height);
+    }
+    resizeToCSS();
+    window.addEventListener("resize", resizeToCSS);
+
+    let drawing = false;
+
+    function getPos(e) {
+      const rect = canvas.getBoundingClientRect();
+      const x = (e.clientX - rect.left);
+      const y = (e.clientY - rect.top);
+      return {x, y};
+    }
+
+    canvas.addEventListener("pointerdown", (e) => {
+      drawing = true;
+      canvas.setPointerCapture(e.pointerId);
+      const p = getPos(e);
+      ctx.beginPath();
+      ctx.moveTo(p.x, p.y);
+    });
+
+    canvas.addEventListener("pointermove", (e) => {
+      if (!drawing) return;
+      const p = getPos(e);
+      ctx.lineTo(p.x, p.y);
+      ctx.stroke();
+    });
+
+    function stop(e) {
+      drawing = false;
+      try { canvas.releasePointerCapture(e.pointerId); } catch {}
+    }
+    canvas.addEventListener("pointerup", stop);
+    canvas.addEventListener("pointercancel", stop);
+
+    return {
+      clear: () => {
+        const rect = canvas.getBoundingClientRect();
+        ctx.clearRect(0, 0, rect.width, rect.height);
+      },
+      toDataURL: () => canvas.toDataURL("image/png")
+    };
+  }
+
+  // Attach controls by data-canvas-id
+  function initDrawingUI() {
+    document.querySelectorAll("canvas.draw-canvas").forEach((canvas) => {
+      const api = initOneCanvas(canvas);
+      const id = canvas.dataset.canvasId;
+
+      const clearBtn = document.querySelector(`[data-action="clear"][data-canvas-id="${id}"]`);
+      const saveBtn  = document.querySelector(`[data-action="save"][data-canvas-id="${id}"]`);
+      const recogBtn = document.querySelector(`[data-action="recognize"][data-canvas-id="${id}"]`);
+
+      const hidden = document.querySelector(`input[type="hidden"][data-canvas-id="${id}"]`);
+      const targetInput = document.querySelector(`input[type="text"][data-canvas-id="${id}"]`);
+
+      if (clearBtn) clearBtn.addEventListener("click", (e) => { e.preventDefault(); api.clear(); });
+      if (saveBtn) saveBtn.addEventListener("click", (e) => {
+        e.preventDefault();
+        if (hidden) hidden.value = api.toDataURL();
+        alert("Drawing saved.");
+      });
+
+      if (recogBtn) recogBtn.addEventListener("click", async (e) => {
+        e.preventDefault();
+        const png = api.toDataURL();
+        if (hidden) hidden.value = png;
+
+        // Call your Flask endpoint
+        try {
+          const resp = await fetch("/api/recognize", {
+            method: "POST",
+            headers: {"Content-Type":"application/json"},
+            body: JSON.stringify({ image_data_url: png })
+          });
+          const data = await resp.json();
+          if (data && data.text && targetInput) {
+            targetInput.value = data.text;
+          } else {
+            alert(data.error || "No recognition result.");
+          }
+        } catch (err) {
+          alert("Recognition failed (endpoint not ready).");
+        }
+      });
+    });
+  }
+
+  document.addEventListener("DOMContentLoaded", initDrawingUI);
+  </script>
+
 </body>
 </html>
 """
@@ -149,7 +298,34 @@ def render_page(title: str, subtitle: str, active: str, content_html: str):
         session=session
     )
 
+def normalize_math_text(s: str) -> str:
+    if not s:
+        return ""
+    s = s.strip()
+    # allow students to type × ÷
+    s = s.replace("×", "*").replace("÷", "/")
+    return s
 
+def value_from_expression_or_equation(user_text: str):
+    """
+    Returns sympy Rational (or expression simplified) or raises.
+    Accepts:
+      - "2/9"
+      - "(4/6)/3"
+      - "(4/6)/3 = 2/9"  (we evaluate LHS and also verify equation true)
+    """
+    t = normalize_math_text(user_text)
+
+    if "=" in t:
+        left, right = t.split("=", 1)
+        left = sp.simplify(sp.sympify(left))
+        right = sp.simplify(sp.sympify(right))
+        if sp.simplify(left - right) != 0:
+            raise ValueError("Equation is not true.")
+        return sp.nsimplify(left)
+
+    expr = sp.simplify(sp.sympify(t))
+    return sp.nsimplify(expr)
 # -------------------------
 # Math checker helpers
 # -------------------------
@@ -354,6 +530,85 @@ def to_latex(expr_str: str) -> str:
 
     return "".join(out)
 
+def _simple_int(allow_negative: bool):
+    n = random.randint(2, 12)
+    if allow_negative and random.random() < 0.35:
+        n = -n
+    return n
+
+def _apply_op(current, op, k, allow_fraction: bool):
+    # current and k are Sympy Rational/Integer
+    if op == "+":
+        return current + k
+    if op == "-":
+        return current - k
+    if op == "×":
+        return current * k
+    if op == "÷":
+        if allow_fraction:
+            return sp.Rational(current, k)  # may become a fraction
+        # force integer division result
+        # make current divisible by k by multiplying first
+        return sp.Integer(current * k) / sp.Integer(k)
+    if op == "^":
+        return current ** int(k)
+    raise ValueError("Unknown op")
+
+def generate_step_pemdas_problem(operations: int, allow_negative: bool, allow_exponents: bool, allow_abs: bool, allow_fraction: bool):
+    """
+    Returns:
+      expr_str: nested expression string
+      steps: list[str] expected results after each step (as strings)
+    Steps correspond to evaluating each nested layer from inner to outer.
+    """
+
+    # Start with (a op b)
+    a = _simple_int(allow_negative)
+    b = _simple_int(allow_negative)
+
+    # choose initial op
+    ops = ["+", "-", "×", "÷"]
+    if allow_exponents:
+        ops.append("^")
+
+    op1 = random.choice(ops)
+
+    # For exponent, keep b small
+    if op1 == "^":
+        b = random.choice([2, 3])
+
+    expr = f"({a} {op1} {b})"
+    val = sp.Rational(a, 1)
+    val = _apply_op(val, op1, sp.Rational(b, 1), allow_fraction)
+
+    if allow_abs and random.random() < 0.25:
+        expr = f"|{expr}|"
+        val = abs(val)
+
+    steps = [str(val)]  # Step 1 result
+
+    # Add more outer layers: ((prev) op k)
+    for _ in range(operations - 1):
+        op = random.choice(ops)
+        k = _simple_int(allow_negative)
+
+        if op == "^":
+            k = random.choice([2, 3])  # keep small
+
+        if op == "÷":
+            # avoid dividing by 0 and keep nicer numbers
+            k = random.randint(2, 10)
+
+        expr = f"({expr} {op} {k})"
+        val = _apply_op(val, op, sp.Rational(k, 1), allow_fraction)
+
+        if allow_abs and random.random() < 0.15:
+            expr = f"|{expr}|"
+            val = abs(val)
+
+        steps.append(str(val))
+
+    return expr, steps
 
 # -------------------------
 # Routes: Auth
@@ -415,6 +670,7 @@ def signup():
         content_html=content,
     )
 
+
 @app.route("/login", methods=["GET", "POST"])
 def login():
     if request.method == "POST":
@@ -424,7 +680,7 @@ def login():
         conn = get_db()
         user = conn.execute(
             "SELECT * FROM users WHERE username = ?",
-            (username,)
+            (username,),
         ).fetchone()
         conn.close()
 
@@ -440,17 +696,17 @@ def login():
     <div class="center">
       <form method="POST">
         <label>Username</label>
-        <input name="username" placeholder="Enter your username" />
+        <input name="username" />
         <label>Password</label>
-        <input type="password" name="password" placeholder="Enter your password" />
+        <input type="password" name="password" />
         <button type="submit">Login</button>
       </form>
-
       <p class="muted" style="margin-top:10px;">
         New here? <a href="/signup">Create an account</a>
       </p>
     </div>
     """
+
     return render_page(
         "Login",
         "Login to access the math practice tabs.",
@@ -464,7 +720,31 @@ def logout():
     flash("Logged out.")
     return redirect(url_for("login"))
 
+@app.route("/api/recognize", methods=["POST"])
+@login_required
+def api_recognize():
+    """
+    Placeholder recognizer:
+    - Receives a base64 PNG from the canvas
+    - Returns dummy text so you can test the full pipeline locally
+    Replace this with a real handwriting OCR API call later.
+    """
+    data = request.get_json(silent=True) or {}
+    img = data.get("image", "")
 
+    if not img.startswith("data:image/png;base64,"):
+        return jsonify(ok=False, error="Invalid image data"), 400
+
+    # decode (not used yet, but proves it's valid)
+    b64 = re.sub("^data:image/png;base64,", "", img)
+    try:
+        _raw = base64.b64decode(b64)
+    except Exception:
+        return jsonify(ok=False, error="Base64 decode failed"), 400
+
+    # TODO: call real OCR here
+    # For now, return something recognizable:
+    return jsonify(ok=True, text="7/3")
 
 # -------------------------
 # Routes: Tabs (Login required)
@@ -475,9 +755,7 @@ def algebra():
     content = f"""
     <div style="display:flex; gap:12px; flex-wrap:wrap; margin-bottom:12px;">
       <a class="tab" href="{url_for('pemdas')}">PEMDAS Practice</a>
-      <!-- add more child pages later -->
-      <!-- <a class="tab" href="...">Equations</a> -->
-      <!-- <a class="tab" href="...">Fractions</a> -->
+      <a class="tab" href="{url_for('pemdas_steps')}">PEMDAS Step-by-Step</a>
     </div>
 
     <p class="muted">Choose a practice set above.</p>
@@ -492,32 +770,29 @@ def algebra():
 @app.route("/algebra/pemdas", methods=["GET", "POST"])
 @login_required
 def pemdas():
-    # Defaults
     operations = int(request.values.get("operations", 5))
     n = int(request.values.get("n", 20))
 
     allow_negative = (request.values.get("neg", "0") == "1")
-    allow_exponents = (request.values.get("exp", "0") == "1")  # default off unless checked
+    allow_exponents = (request.values.get("exp", "0") == "1")
     allow_abs = (request.values.get("abs", "0") == "1")
     allow_fraction = (request.values.get("frac", "0") == "1")
 
-    # Clamp to safe ranges
     operations = max(1, min(operations, 10))
     if n not in (5, 10, 15, 20):
         n = 20
 
-    settings_key = f"pemdas_settings"
-    problems_key = f"pemdas_problems"
+    settings_key = "pemdas_settings"
+    problems_key = "pemdas_problems"
 
-    # If user clicked "Generate" (GET) or first time, generate new set
     if request.method == "GET":
         session[settings_key] = {
-        "operations": operations,
-        "n": n,
-        "neg": allow_negative,
-        "exp": allow_exponents,
-        "abs": allow_abs,
-        "frac": allow_fraction,
+            "operations": operations,
+            "n": n,
+            "neg": allow_negative,
+            "exp": allow_exponents,
+            "abs": allow_abs,
+            "frac": allow_fraction,
         }
         session[problems_key] = generate_pemdas_set(
             operations=operations,
@@ -526,7 +801,7 @@ def pemdas():
             allow_exponents=allow_exponents,
             allow_abs=allow_abs,
             allow_fraction=allow_fraction,
-            )
+        )
 
     problems = session.get(problems_key, [])
     settings = session.get(settings_key, {
@@ -538,53 +813,6 @@ def pemdas():
         "frac": allow_fraction,
     })
 
-    result_html = ""
-    if request.method == "POST":
-        # use stored problems (so answers match what user saw)
-        correct_count = 0
-        rows_html = []
-
-        for i, p in enumerate(problems):
-            user_val = request.form.get(f"a{i}", "").strip()
-            is_correct = False
-            try:
-                # allow integers or fractions like 7/3
-                user_num = sp.Rational(user_val)  # works for "5" and "7/3"
-                ans_num = sp.Rational(p["ans"])   # p["ans"] is stored as a string
-                is_correct = (sp.simplify(user_num - ans_num) == 0)
-            except:
-                is_correct = False
-
-            if is_correct:
-                correct_count += 1
-
-            mark = "✅" if is_correct else "❌"
-            latex_expr = to_latex(p["expr"])
-            rows_html.append(
-                f"<tr>"
-                f"<td>{i+1}</td>"
-                f"<td>\\({latex_expr}\\)</td>"
-                f"<td>{user_val if user_val else '<span class=muted>(blank)</span>'}</td>"
-                f"<td>{mark} <span class=muted>(Ans: \\({sp.latex(sp.Rational(p['ans']))}\\))</span></td>"
-                f"</tr>"
-            )
-
-        result_html = f"""
-        <hr>
-        <p><b>Score:</b> {correct_count}/{len(problems)}</p>
-        <table style="width:100%; border-collapse:collapse;">
-          <thead>
-            <tr style="text-align:left; border-bottom:1px solid #eee;">
-              <th>#</th><th>Problem</th><th>Your Answer</th><th>Result</th>
-            </tr>
-          </thead>
-          <tbody>
-            {''.join(rows_html)}
-          </tbody>
-        </table>
-        """
-
-    # Settings form (GET) + Problems form (POST)
     checked_neg = "checked" if settings.get("neg") else ""
     checked_exp = "checked" if settings.get("exp") else ""
     checked_abs = "checked" if settings.get("abs") else ""
@@ -592,8 +820,6 @@ def pemdas():
 
     settings_html = f"""
 <form method="GET" style="margin-bottom:14px;">
-
-  <!-- Row 1: dropdowns -->
   <div>
     <label><b>Operations (1–10)</b></label>
     <select name="operations">
@@ -611,7 +837,6 @@ def pemdas():
     </select>
   </div>
 
-  <!-- Row 2: checkboxes -->
   <div style="margin-top:14px;">
     <label><input type="checkbox" name="neg" value="1" {checked_neg}/> Allow negatives</label><br>
     <label><input type="checkbox" name="exp" value="1" {checked_exp}/> Allow exponents</label><br>
@@ -619,13 +844,9 @@ def pemdas():
     <label><input type="checkbox" name="frac" value="1" {checked_frac}/> Allow fractions</label>
   </div>
 
-  <!-- Row 3: button at bottom -->
   <div style="margin-top:16px;">
     <button type="submit">Generate</button>
   </div>
-
-  <p class="muted" style="margin-top:10px;">Tip: click Generate to make a new set.</p>
-
 </form>
 """
 
@@ -636,11 +857,64 @@ def pemdas():
           <div style="display:flex; gap:12px; align-items:center; margin:14px 0;">
             <div style="width:30px;"><b>{i+1}.</b></div>
             <div style="flex:1; font-size:20px;">\\({latex_expr}\\)</div>
-            <div style="width:180px;">
-              <input name="a{i}" placeholder="Answer" />
+            <div style="width:220px;">
+              <input name="a{i}" placeholder="Answer (e.g., 7/3)" />
             </div>
           </div>
         """)
+
+    result_html = ""
+    if request.method == "POST":
+        action = request.form.get("action", "check")  # "check" or "submit"
+        reveal = (action == "submit")
+
+        correct_count = 0
+        rows = []
+
+        for i, p in enumerate(problems):
+            user_val = (request.form.get(f"a{i}", "") or "").strip()
+            ok = False
+            err = ""
+
+            try:
+                u = value_from_expression_or_equation(user_val)
+                e = sp.nsimplify(sp.Rational(p["ans"]))
+                ok = (sp.simplify(u - e) == 0)
+            except Exception as ex:
+                ok = False
+                err = str(ex)
+
+            if ok:
+                correct_count += 1
+
+            mark = "✅" if ok else "❌"
+            ans_html = f"<span class=muted>(Ans: \\({sp.latex(sp.Rational(p['ans']))}\\))</span>" if reveal else "<span class=muted>(Hidden)</span>"
+            err_html = f"<div class='muted'>Error: {err}</div>" if (err and not ok) else ""
+
+            latex_expr = to_latex(p["expr"])
+            rows.append(
+                f"<tr>"
+                f"<td>{i+1}</td>"
+                f"<td>\\({latex_expr}\\)</td>"
+                f"<td>{user_val if user_val else '<span class=muted>(blank)</span>'}{err_html}</td>"
+                f"<td>{mark} {ans_html}</td>"
+                f"</tr>"
+            )
+
+        result_html = f"""
+        <hr>
+        <p><b>Score:</b> {correct_count}/{len(problems)}</p>
+        <table style="width:100%; border-collapse:collapse;">
+          <thead>
+            <tr style="text-align:left; border-bottom:1px solid #eee;">
+              <th>#</th><th>Problem</th><th>Your Answer</th><th>Result</th>
+            </tr>
+          </thead>
+          <tbody>
+            {''.join(rows)}
+          </tbody>
+        </table>
+        """
 
     content = f"""
     <div style="margin-bottom:12px;">
@@ -652,7 +926,8 @@ def pemdas():
 
     <form method="POST">
       {''.join(problems_html)}
-      <button type="submit">Check Answers</button>
+      <button type="submit" name="action" value="check">Check Answers (No Key)</button>
+      <button type="submit" name="action" value="submit" style="margin-left:10px;">Submit & Show Answers</button>
     </form>
 
     {result_html}
@@ -661,6 +936,178 @@ def pemdas():
     return render_page(
         title="Algebra Foundation — PEMDAS",
         subtitle="Random order-of-operations practice with answer checking.",
+        active="algebra",
+        content_html=content
+    )
+
+@app.route("/algebra/pemdas-steps", methods=["GET", "POST"])
+@login_required
+def pemdas_steps():
+    # Defaults
+    operations = int(request.values.get("operations", 4))
+    operations = max(2, min(operations, 8))
+
+    allow_negative = (request.values.get("neg", "0") == "1")
+    allow_exponents = (request.values.get("exp", "0") == "1")
+    allow_abs = (request.values.get("abs", "0") == "1")
+    allow_fraction = (request.values.get("frac", "0") == "1")
+
+    key = "pemdas_steps_problem"
+
+    # Generate new problem on GET or when user clicks "New Problem"
+    if request.method == "GET" or request.form.get("action") == "new":
+        expr, steps = generate_step_pemdas_problem(
+            operations=operations,
+            allow_negative=allow_negative,
+            allow_exponents=allow_exponents,
+            allow_abs=allow_abs,
+            allow_fraction=allow_fraction,
+        )
+        session[key] = {
+            "expr": expr,
+            "steps": steps,
+            "settings": {
+                "operations": operations,
+                "neg": allow_negative,
+                "exp": allow_exponents,
+                "abs": allow_abs,
+                "frac": allow_fraction,
+            }
+        }
+
+    data = session.get(key)
+    if not data:
+        expr, steps = generate_step_pemdas_problem(operations, allow_negative, allow_exponents, allow_abs, allow_fraction)
+        data = {"expr": expr, "steps": steps, "settings": {"operations": operations, "neg": allow_negative, "exp": allow_exponents, "abs": allow_abs, "frac": allow_fraction}}
+        session[key] = data
+
+    expr = data["expr"]
+    steps = data["steps"]
+    settings = data["settings"]
+
+    checked_neg = "checked" if settings.get("neg") else ""
+    checked_exp = "checked" if settings.get("exp") else ""
+    checked_abs = "checked" if settings.get("abs") else ""
+    checked_frac = "checked" if settings.get("frac") else ""
+
+    result_html = ""
+    if request.method == "POST" and request.form.get("action") == "check":
+        rows = []
+        correct_count = 0
+
+        for i, expected in enumerate(steps):
+            user_val = request.form.get(f"s{i}", "").strip()
+
+            ok = False
+            try:
+                u = sp.Rational(user_val)
+                e = sp.Rational(expected)
+                ok = (sp.simplify(u - e) == 0)
+            except:
+                ok = False
+
+            if ok:
+                correct_count += 1
+
+            mark = "✅" if ok else "❌"
+            rows.append(
+                f"<tr>"
+                f"<td><b>Step {i+1}</b></td>"
+                f"<td>{user_val if user_val else '<span class=muted>(blank)</span>'}</td>"
+                f"<td>{mark} <span class=muted>(Correct: \\({sp.latex(sp.Rational(expected))}\\))</span></td>"
+                f"</tr>"
+            )
+
+        result_html = f"""
+        <hr>
+        <p><b>Steps correct:</b> {correct_count}/{len(steps)}</p>
+        <table style="width:100%; border-collapse:collapse;">
+          <thead>
+            <tr style="text-align:left; border-bottom:1px solid #eee;">
+              <th>Step</th><th>Your result</th><th>Check</th>
+            </tr>
+          </thead>
+          <tbody>
+            {''.join(rows)}
+          </tbody>
+        </table>
+        """
+
+    latex_expr = to_latex(expr)
+
+    settings_html = f"""
+    <form method="GET" style="margin-bottom:14px;">
+      <div>
+        <label><b>How many steps?</b> (2–8)</label>
+        <select name="operations">
+          {''.join([f'<option value="{k}" {"selected" if settings.get("operations")==k else ""}>{k}</option>' for k in range(2, 9)])}
+        </select>
+      </div>
+
+      <div style="margin-top:14px;">
+        <label><input type="checkbox" name="neg" value="1" {checked_neg}/> Allow negatives</label><br>
+        <label><input type="checkbox" name="exp" value="1" {checked_exp}/> Allow exponents</label><br>
+        <label><input type="checkbox" name="abs" value="1" {checked_abs}/> Allow absolute values</label><br>
+        <label><input type="checkbox" name="frac" value="1" {checked_frac}/> Allow fractions</label>
+      </div>
+
+      <div style="margin-top:16px;">
+        <button type="submit">Generate New Problem</button>
+      </div>
+    </form>
+    """
+
+    # “Canvas” boxes: one input per step
+    step_inputs = []
+    for i in range(len(steps)):
+        step_inputs.append(f"""
+          <div style="margin:18px 0; padding:14px; border:1px solid #eee; border-radius:14px;">
+            <div style="font-weight:700; margin-bottom:8px;">Step {i+1}</div>
+
+            <input type="text" name="s{i}" data-canvas-id="step{i}"
+                   placeholder="Type an equivalent expression or equation (example: (4/6)/3 or (4/6)/3=2/9)" />
+
+            <div class="muted" style="margin-top:10px;">Or draw below (optional):</div>
+            <div class="draw-wrap">
+              <canvas class="draw-canvas" data-canvas-id="step{i}"></canvas>
+
+              <input type="hidden" name="draw{i}" data-canvas-id="step{i}" value="" />
+
+              <div class="draw-actions">
+                <button class="btn-lite" data-action="clear" data-canvas-id="step{i}">Clear</button>
+                <button class="btn-lite" data-action="save" data-canvas-id="step{i}">Save Drawing</button>
+                <button data-action="recognize" data-canvas-id="step{i}">Use Drawing (Recognize)</button>
+              </div>
+            </div>
+          </div>
+        """)
+
+    content = f"""
+    <div style="margin-bottom:12px;">
+      <a class="tab" href="{url_for('algebra')}">← Back to Algebra</a>
+    </div>
+
+    <p class="muted">Solve the problem one layer at a time. Enter your result after each step.</p>
+
+    {settings_html}
+
+    <div style="font-size:22px; margin: 10px 0 16px 0;">
+      <b>Problem:</b> \\({latex_expr}\\)
+    </div>
+
+    <form method="POST">
+      {''.join(step_inputs)}
+      <button type="submit" name="action" value="check">Check Steps (No Answers)</button>
+    <button type="submit" name="action" value="submit" style="margin-left:10px;">Submit (Show Answers)</button>
+    <button type="submit" name="action" value="new" style="margin-left:10px;">New Problem</button>  
+    </form>
+
+    {result_html}
+    """
+
+    return render_page(
+        title="Algebra Foundation — PEMDAS Step-by-Step",
+        subtitle="One problem at a time, with step checking.",
         active="algebra",
         content_html=content
     )
