@@ -1,0 +1,4 @@
+cd ~/Desktop/"Math Website"
+conda deactivate
+source venv/bin/activate
+python MathSiteCode.py
